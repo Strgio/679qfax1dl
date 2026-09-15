@@ -218,6 +218,13 @@
     <label class="chk row"><input type="checkbox" id="spatial" checked><span>Bass below · treble above</span></label>
     <label class="chk row"><input type="checkbox" id="drops" checked><span>Drops hit harder</span></label>
   </section>
+  <section>
+    <h4>Fluid</h4>
+    <label class="chk row" title="second-order MacCormack advection — thin filaments, longer-lived vortices"><input type="checkbox" id="macc"><span>Sharp advection</span></label>
+    <label class="row" title="the ν∇²u term of Navier–Stokes. 0 = inviscid ink · right = oil · far right = honey"><span>Viscosity</span><input type="range" id="visc" min="0" max="100" value="0"></label>
+    <label class="chk row" title="loud passages thin the fluid, breakdowns thicken it, drops shatter it"><input type="checkbox" id="viscMusic" checked><span>Music → viscosity</span></label>
+    <div id="physInfo" style="font-size:9px;letter-spacing:.2em;color:rgba(215,225,220,.5);min-height:13px">ν 0</div>
+  </section>
   <div id="keys"><b>H</b> options &nbsp; <b>F</b> fullscreen &nbsp; <b>U</b> hide ui &nbsp; <b>1–9</b> palette &nbsp; <b>space</b> burst</div>
 </div>
 <div id="flash"></div>
@@ -248,8 +255,7 @@ const CONFIG = {
 };
 
 /* ---------- device: touch / iOS / iPadOS ----------
-   iPadOS Safari reports a Mac UA — detect it via touch points. Mobile GPUs get a lighter sim:
-   dye 1440 × DPR 2 on an A12X is ~10 M px per pass; 900 × DPR 1.5 keeps it at 60 fps and cool. */
+   iPadOS Safari reports a Mac UA — detect it via touch points. Mobile GPUs get a lighter sim. */
 const IS_TOUCH = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 1;
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) || /iP(hone|ad|od)/.test(navigator.userAgent);
 const IS_STANDALONE = !!navigator.standalone || matchMedia('(display-mode: standalone)').matches;
@@ -262,6 +268,28 @@ if (IS_TOUCH) {
   MAX_DPR = 1.5;
   document.getElementById('hint').innerHTML = 'drag to stir &nbsp;·&nbsp; tap for a burst &nbsp;·&nbsp; ⋯ for options';
 }
+
+/* ---------- physics upgrades (Navier-Stokes terms the classic demo drops) ----------
+   macCormack: second-order advection (Selle 2008). Filaments stay thin, vortices live longer; ~3x advection cost.
+   viscosity: the real nu*laplacian(u) term. 0 = the inviscid Euler fluid we had; up = ink -> oil -> honey.
+   musicVisc: energy thins the fluid (drops shatter it), breakdowns thicken it — a Reynolds number driven by the track. */
+const PHYS = {
+  macCormack: false,
+  maccVelocity: false,         /* MacCormack on velocity too — sharper but grid-noisy unless viscosity floor > 0 */
+  viscosity: 0.0,              /* 0..1 slider */
+  VISC_ITERATIONS: IS_TOUCH ? 8 : 12,
+  music: true,
+  viscEnv: 1.0,                /* smoothed multiplier on viscosity from the music */
+  musicVisc(dt) {
+    if (!this.music || !AUDIO.active) { this.viscEnv += (1 - this.viscEnv) * Math.min(1, dt * 3); return this.viscEnv; }
+    /* energy 0.7 (breakdown) -> x2.2 thicker, 1.0 -> x1, 1.35+ (rising) -> x0.35; a drop cuts it to ~0 for a moment */
+    const e = Math.max(0.5, Math.min(1.6, AUDIO.energy));
+    let target = e < 1 ? 1 + (1 - e) * 4 : Math.max(0.2, 1 - (e - 1) * 1.9);
+    target *= 1 - Math.min(1, AUDIO.dropPulse * 1.5);
+    this.viscEnv += (target - this.viscEnv) * Math.min(1, dt * (target < this.viscEnv ? 6 : 1.2));  /* thins fast, thickens slow */
+    return this.viscEnv;
+  },
+};
 
 /* ---------- palettes: two ink families each, on black ---------- */
 const PALETTES = [
@@ -583,6 +611,53 @@ const advectionShader = compileShader(gl.FRAGMENT_SHADER, `
     gl_FragColor = result / decay;
   }`);
 
+/* MacCormack / BFECC correction (Selle et al. 2008): given phi1 = advect(phi0, +dt) and phi2 = advect(phi1, -dt),
+   the round-trip error (phi0 - phi2)/2 is added back, then clamped to the bilinear neighbourhood of phi0 at the
+   backtraced point so it can't overshoot. Second-order accuracy: filaments stay thin, vortices live longer. */
+const macCormackShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision highp float; precision highp sampler2D;
+  varying vec2 vUv;
+  uniform sampler2D uVelocity;
+  uniform sampler2D uSource;   /* phi0 */
+  uniform sampler2D uFwd;      /* phi1 */
+  uniform sampler2D uBack;     /* phi2 */
+  uniform vec2 texelSize;      /* velocity grid */
+  uniform vec2 srcTexelSize;   /* phi grid */
+  uniform float dt;
+  uniform float dissipation;
+  void main () {
+    vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texelSize;
+    vec4 phi1 = texture2D(uFwd, vUv);
+    vec4 phi2 = texture2D(uBack, vUv);
+    vec4 phi0 = texture2D(uSource, vUv);
+    vec4 r = phi1 + 0.5 * (phi0 - phi2);
+    vec2 st = coord / srcTexelSize - 0.5;
+    vec2 i = floor(st) + 0.5;
+    vec4 a = texture2D(uSource, (i + vec2(0.0, 0.0)) * srcTexelSize);
+    vec4 b = texture2D(uSource, (i + vec2(1.0, 0.0)) * srcTexelSize);
+    vec4 c = texture2D(uSource, (i + vec2(0.0, 1.0)) * srcTexelSize);
+    vec4 d = texture2D(uSource, (i + vec2(1.0, 1.0)) * srcTexelSize);
+    r = clamp(r, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
+    gl_FragColor = r / (1.0 + dissipation * dt);
+  }`);
+
+/* viscosity: the nu * laplacian(u) term of Navier-Stokes, solved implicitly (Stam 1999) so any nu is stable.
+   Jacobi iterate  u = (u0 + a*(L+R+T+B)) / (1+4a),  a = nu*dt in texel units. */
+const viscosityShader = compileShader(gl.FRAGMENT_SHADER, `
+  precision highp float; precision highp sampler2D;
+  varying vec2 vUv, vL, vR, vT, vB;
+  uniform sampler2D uVelocity;   /* current iterate */
+  uniform sampler2D uSource;     /* u0 */
+  uniform float alpha;
+  void main () {
+    vec2 L = texture2D(uVelocity, vL).xy;
+    vec2 R = texture2D(uVelocity, vR).xy;
+    vec2 T = texture2D(uVelocity, vT).xy;
+    vec2 B = texture2D(uVelocity, vB).xy;
+    vec2 u0 = texture2D(uSource, vUv).xy;
+    gl_FragColor = vec4((u0 + alpha * (L + R + T + B)) / (1.0 + 4.0 * alpha), 0.0, 1.0);
+  }`);
+
 const divergenceShader = compileShader(gl.FRAGMENT_SHADER, `
   precision mediump float; precision mediump sampler2D;
   varying highp vec2 vUv, vL, vR, vT, vB;
@@ -801,7 +876,7 @@ function getResolution(resolution) {
   return { width: min, height: max };
 }
 
-let dye, velocity, divergence, curl, pressure;
+let dye, velocity, divergence, curl, pressure, velTmp, velTmp2, dyeTmp, dyeTmp2;
 function initFramebuffers() {
   const simRes = getResolution(CONFIG.SIM_RESOLUTION);
   const dyeRes = getResolution(CONFIG.DYE_RESOLUTION);
@@ -815,6 +890,11 @@ function initFramebuffers() {
   divergence = createFBO(simRes.width, simRes.height, r.internalFormat, r.format, texType, gl.NEAREST);
   curl = createFBO(simRes.width, simRes.height, r.internalFormat, r.format, texType, gl.NEAREST);
   pressure = createDoubleFBO(simRes.width, simRes.height, r.internalFormat, r.format, texType, gl.NEAREST);
+  /* scratch for MacCormack (forward / backward passes) and viscosity (u0) */
+  velTmp  = createFBO(simRes.width, simRes.height, rg.internalFormat, rg.format, texType, filtering);
+  velTmp2 = createFBO(simRes.width, simRes.height, rg.internalFormat, rg.format, texType, filtering);
+  dyeTmp  = createFBO(dyeRes.width, dyeRes.height, rgba.internalFormat, rgba.format, texType, filtering);
+  dyeTmp2 = createFBO(dyeRes.width, dyeRes.height, rgba.internalFormat, rgba.format, texType, filtering);
 }
 
 /* ---------- programs ---------- */
@@ -822,6 +902,8 @@ const copyProgram       = createProgram(baseVertexShader, copyShader);
 const clearProgram      = createProgram(baseVertexShader, clearShader);
 const splatProgram      = createProgram(baseVertexShader, splatShader);
 const advectionProgram  = createProgram(baseVertexShader, advectionShader);
+const macCormackProgram = createProgram(baseVertexShader, macCormackShader);
+const viscosityProgram  = createProgram(baseVertexShader, viscosityShader);
 const divergenceProgram = createProgram(baseVertexShader, divergenceShader);
 const curlProgram       = createProgram(baseVertexShader, curlShader);
 const vorticityProgram  = createProgram(baseVertexShader, vorticityShader);
@@ -1288,6 +1370,23 @@ function step(dt) {
   blit(velocity.write);
   velocity.swap();
 
+  /* ---- viscosity (nu * laplacian u), implicit Jacobi. Music: energy thins the fluid, breakdowns thicken it. ---- */
+  const nu = PHYS.viscosity * PHYS.musicVisc(dt);
+  if (nu > 0.0005) {
+    copyProgram.bind();
+    gl.uniform1i(copyProgram.uniforms.uTexture, velocity.read.attach(0));
+    blit(velTmp);                                   /* u0 */
+    viscosityProgram.bind();
+    gl.uniform2f(viscosityProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(viscosityProgram.uniforms.uSource, velTmp.attach(1));
+    gl.uniform1f(viscosityProgram.uniforms.alpha, nu * 6.0 * dt * 60.0);   /* alpha 0..6 at 60 fps; 12 Jacobi sweeps */
+    for (let i = 0; i < PHYS.VISC_ITERATIONS; i++) {
+      gl.uniform1i(viscosityProgram.uniforms.uVelocity, velocity.read.attach(0));
+      blit(velocity.write);
+      velocity.swap();
+    }
+  }
+
   divergenceProgram.bind();
   gl.uniform2f(divergenceProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
   gl.uniform1i(divergenceProgram.uniforms.uVelocity, velocity.read.attach(0));
@@ -1315,20 +1414,63 @@ function step(dt) {
   blit(velocity.write);
   velocity.swap();
 
+  const dyeDiss = CONFIG.DENSITY_DISSIPATION * (1 + (AUDIO.active ? 0.35 + AUDIO.level * 0.5 : 0));
+  if (PHYS.macCormack) {
+    if (PHYS.maccVelocity) advectMacCormack(velocity, velTmp, velTmp2, dt, CONFIG.VELOCITY_DISSIPATION);
+    else {
+      advectionProgram.bind();
+      gl.uniform2f(advectionProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+      gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
+      gl.uniform1i(advectionProgram.uniforms.uSource, velocity.read.attach(0));
+      gl.uniform1f(advectionProgram.uniforms.dt, dt);
+      gl.uniform1f(advectionProgram.uniforms.dissipation, CONFIG.VELOCITY_DISSIPATION);
+      blit(velocity.write);
+      velocity.swap();
+    }
+    advectMacCormack(dye, dyeTmp, dyeTmp2, dt, dyeDiss);
+  } else {
+    advectionProgram.bind();
+    gl.uniform2f(advectionProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+    gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(advectionProgram.uniforms.uSource, velocity.read.attach(0));
+    gl.uniform1f(advectionProgram.uniforms.dt, dt);
+    gl.uniform1f(advectionProgram.uniforms.dissipation, CONFIG.VELOCITY_DISSIPATION);
+    blit(velocity.write);
+    velocity.swap();
+
+    gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
+    gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
+    gl.uniform1f(advectionProgram.uniforms.dissipation, dyeDiss);
+    blit(dye.write);
+    dye.swap();
+  }
+}
+
+/* MacCormack advection of a double-FBO `field` by the current velocity:
+   phi1 = A(phi0, dt) -> tmp ; phi2 = A(phi1, -dt) -> tmp2 ; corrected = phi1 + (phi0 - phi2)/2, clamped. */
+function advectMacCormack(field, tmp, tmp2, dt, dissipation) {
   advectionProgram.bind();
   gl.uniform2f(advectionProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
   gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
-  gl.uniform1i(advectionProgram.uniforms.uSource, velocity.read.attach(0));
+  gl.uniform1f(advectionProgram.uniforms.dissipation, 0.0);
+  gl.uniform1i(advectionProgram.uniforms.uSource, field.read.attach(1));
   gl.uniform1f(advectionProgram.uniforms.dt, dt);
-  gl.uniform1f(advectionProgram.uniforms.dissipation, CONFIG.VELOCITY_DISSIPATION);
-  blit(velocity.write);
-  velocity.swap();
+  blit(tmp);
+  gl.uniform1i(advectionProgram.uniforms.uSource, tmp.attach(1));
+  gl.uniform1f(advectionProgram.uniforms.dt, -dt);
+  blit(tmp2);
 
-  gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
-  gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
-  gl.uniform1f(advectionProgram.uniforms.dissipation, CONFIG.DENSITY_DISSIPATION * (1 + (AUDIO.active ? 0.35 + AUDIO.level * 0.5 : 0)));
-  blit(dye.write);
-  dye.swap();
+  macCormackProgram.bind();
+  gl.uniform2f(macCormackProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
+  gl.uniform2f(macCormackProgram.uniforms.srcTexelSize, field.texelSizeX, field.texelSizeY);
+  gl.uniform1i(macCormackProgram.uniforms.uVelocity, velocity.read.attach(0));
+  gl.uniform1i(macCormackProgram.uniforms.uSource, field.read.attach(1));
+  gl.uniform1i(macCormackProgram.uniforms.uFwd, tmp.attach(2));
+  gl.uniform1i(macCormackProgram.uniforms.uBack, tmp2.attach(3));
+  gl.uniform1f(macCormackProgram.uniforms.dt, dt);
+  gl.uniform1f(macCormackProgram.uniforms.dissipation, dissipation);
+  blit(field.write);
+  field.swap();
 }
 
 function render() {
@@ -1372,7 +1514,14 @@ const ui = {
   chroma: document.getElementById('chroma'), note: document.getElementById('note'),
   pitchLight: document.getElementById('pitchLight'), noiseGrey: document.getElementById('noiseGrey'), spatial: document.getElementById('spatial'),
   drops: document.getElementById('drops'), energy: document.getElementById('energy'), flash: document.getElementById('flash'),
+  macc: document.getElementById('macc'), visc: document.getElementById('visc'), viscMusic: document.getElementById('viscMusic'), physInfo: document.getElementById('physInfo'),
 };
+/* fluid physics controls. With MacCormack on, vorticity confinement was compensating for blur that no longer exists — ease it off. */
+const CURL_BASE = CONFIG.CURL;
+function setMacCormack(on) { PHYS.macCormack = on; ui.macc.checked = on; CONFIG.CURL = on ? CURL_BASE * 0.7 : CURL_BASE; }
+ui.macc.addEventListener('change', () => { setMacCormack(ui.macc.checked); saveSettings(); });
+ui.visc.addEventListener('input', () => { PHYS.viscosity = ui.visc.value / 100; saveSettings(); });
+ui.viscMusic.addEventListener('change', () => { PHYS.music = ui.viscMusic.checked; saveSettings(); });
 ui.drops.addEventListener('change', () => { AUDIO.drops = ui.drops.checked; saveSettings(); });
 for (let i = 0; i < 12; i++) { const b = document.createElement('i'); b.title = NOTE_NAMES[i]; ui.chroma.appendChild(b); }
 ui.chromaBars = [...ui.chroma.children];
@@ -1453,6 +1602,13 @@ ui.bpmFlow.addEventListener('change', () => { setBpmFlow(ui.bpmFlow.checked); sa
 
 /* ---------- settings persist in localStorage ---------- */
 const SETTINGS_KEY = 'nocturne.settings.v1';
+/* default look — captured from Eric's live tuning, Sep 2026 */
+const DEFAULTS = {
+  pal: 'strigo', inkA: '#ff2a6d', inkB: '#00e5ff', hue: 0, sat: 1.37, drift: false,
+  sens: 0.71, kickBurst: true, tempoFlow: 2, flowBase: 0.71, bpmFlow: true,
+  syn: 'rainbow', pitchLight: true, noiseGrey: true, spatial: true, drops: true,
+  macc: true, visc: 0.66, viscMusic: true,
+};
 let settingsReady = false;
 function saveSettings() {
   if (!settingsReady) return;
@@ -1460,12 +1616,15 @@ function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
       pal: PAL.name, inkA: CUSTOM.hexA, inkB: CUSTOM.hexB, hue: GRADE.hueBase, sat: GRADE.sat, drift: GRADE.drift, sens: AUDIO.sens, kickBurst: AUDIO.kickBurst, tempoFlow: AUDIO.tempoFlow, flowBase: AUDIO.flowBase, bpmFlow: AUDIO.bpmFlow,
       syn: SYN.mode, pitchLight: SYN.pitchLight, noiseGrey: SYN.noiseGrey, spatial: SYN.spatial, drops: AUDIO.drops,
+      macc: PHYS.macCormack, visc: PHYS.viscosity, viscMusic: PHYS.music,
     }));
   } catch (e) {}
 }
 function loadSettings() {
   let s = null;
   try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY)); } catch (e) {}
+  /* house defaults (Eric's tuned look) — saved settings override per key */
+  s = Object.assign({}, DEFAULTS, s || {});
   if (s) {
     if (s.inkA) applyCustom('A', s.inkA, false);
     if (s.inkB) applyCustom('B', s.inkB, false);
@@ -1481,6 +1640,9 @@ function loadSettings() {
     if (WHEELS[s.syn] || s.syn === 'locked' || s.syn === 'off') setSyn(s.syn);
     for (const k of ['pitchLight', 'noiseGrey', 'spatial']) if (s[k] != null) { SYN[k] = !!s[k]; ui[k].checked = SYN[k]; }
     if (s.drops != null) { AUDIO.drops = !!s.drops; ui.drops.checked = AUDIO.drops; }
+    if (s.macc != null) setMacCormack(!!s.macc);
+    if (s.visc != null) { PHYS.viscosity = +s.visc; ui.visc.value = Math.round(PHYS.viscosity * 100); }
+    if (s.viscMusic != null) { PHYS.music = !!s.viscMusic; ui.viscMusic.checked = PHYS.music; }
   }
   settingsReady = true;
 }
@@ -1594,6 +1756,9 @@ function updateMeter() {
     const bpmTxt = A.bpm ? Math.round(A.bpm) + ' bpm' + (TEMPO.conf < 0.35 ? '?' : '') : (TEMPO.filled < 300 ? 'bpm ' + '·'.repeat(1 + (TEMPO.filled / 100 | 0)) : 'bpm —');
     ui.energy.textContent = bpmTxt + ' · flow ' + (A.flowScale * A.flowBase).toFixed(2) + '× · ' + `energy ${eLabel} ${A.energy.toFixed(2)}` + (A.dropPulse > 0.3 ? ' · DROP' : '');
   } else ui.energy.textContent = '—';
+  { const nu = PHYS.viscosity * PHYS.viscEnv;
+    const word = nu < 0.005 ? 'inviscid' : nu < 0.12 ? 'ink' : nu < 0.35 ? 'oil' : nu < 0.7 ? 'syrup' : 'honey';
+    ui.physInfo.textContent = `ν ${nu.toFixed(2)} · ${word}` + (PHYS.music && A.active ? ` · music ×${PHYS.viscEnv.toFixed(2)}` : '') + (PHYS.macCormack ? ' · 2nd-order' : ' · 1st-order'); }
   if (!S.live) ui.note.textContent = S.mode === 'off' ? '—' : 'waiting for sound';
   else ui.note.innerHTML = `<b>${S.pc1 >= 0 ? NOTE_NAMES[S.pc1] : '·'}</b>${S.pc2 >= 0 ? ' / ' + NOTE_NAMES[S.pc2] : ''}`
       + ` &nbsp;·&nbsp; light ${(S.bright * 100) | 0} &nbsp;·&nbsp; tone ${(S.harm * 100) | 0} &nbsp;·&nbsp; hit ${(S.perc * 100) | 0}`;
