@@ -277,12 +277,14 @@ const PHYS = {
   macCormack: false,
   maccVelocity: false,         /* MacCormack on velocity too — sharper but grid-noisy unless viscosity floor > 0 */
   viscosity: 0.0,              /* 0..1 slider */
-  VISC_ITERATIONS: IS_TOUCH ? 8 : 12,
+  VISC_ALPHA: 6.0,             /* alpha at slider=1, music x1, 60 fps */
+  VISC_MAX_SUB: IS_TOUCH ? 4 : 6,             /* substeps cap: worst case alpha 18 -> 6 x alpha 3 (still converges ok in 4 sweeps) */
+  VISC_ITERATIONS: 4,          /* Jacobi sweeps per substep; alpha<=~3 converges to ~1% in 4 */
   music: true,
   viscEnv: 1.0,                /* smoothed multiplier on viscosity from the music */
   musicVisc(dt) {
     if (!this.music || !AUDIO.active) { this.viscEnv += (1 - this.viscEnv) * Math.min(1, dt * 3); return this.viscEnv; }
-    /* energy 0.7 (breakdown) -> x2.2 thicker, 1.0 -> x1, 1.35+ (rising) -> x0.35; a drop cuts it to ~0 for a moment */
+    /* energy 0.7 (breakdown) -> x2.2 thicker, 0.5 floor -> x3, 1.0 -> x1, 1.35+ (rising) -> x0.35; a drop cuts it to ~0 for a moment */
     const e = Math.max(0.5, Math.min(1.6, AUDIO.energy));
     let target = e < 1 ? 1 + (1 - e) * 4 : Math.max(0.2, 1 - (e - 1) * 1.9);
     target *= 1 - Math.min(1, AUDIO.dropPulse * 1.5);
@@ -852,7 +854,8 @@ function createFBO(w, h, internalFormat, format, type, filter) {
       gl.activeTexture(gl.TEXTURE0 + id);
       gl.bindTexture(gl.TEXTURE_2D, texture);
       return id;
-    }
+    },
+    destroy() { gl.deleteFramebuffer(fbo); gl.deleteTexture(texture); }
   };
 }
 function createDoubleFBO(w, h, internalFormat, format, type, filter) {
@@ -862,7 +865,8 @@ function createDoubleFBO(w, h, internalFormat, format, type, filter) {
     width: w, height: h, texelSizeX: fbo1.texelSizeX, texelSizeY: fbo1.texelSizeY,
     get read() { return fbo1; }, set read(v) { fbo1 = v; },
     get write() { return fbo2; }, set write(v) { fbo2 = v; },
-    swap() { const t = fbo1; fbo1 = fbo2; fbo2 = t; }
+    swap() { const t = fbo1; fbo1 = fbo2; fbo2 = t; },
+    destroy() { fbo1.destroy(); fbo2.destroy(); }
   };
 }
 
@@ -884,6 +888,8 @@ function initFramebuffers() {
   const rgba = ext.formatRGBA, rg = ext.formatRG, r = ext.formatR;
   const filtering = ext.supportLinearFiltering ? gl.LINEAR : gl.NEAREST;
   gl.disable(gl.BLEND);
+  /* release the previous set — resize (rotation, toolbar collapse) would otherwise leak ~50 MB of half-float textures each time */
+  for (const f of [dye, velocity, divergence, curl, pressure, velTmp, velTmp2, dyeTmp, dyeTmp2]) if (f) f.destroy();
 
   dye = createDoubleFBO(dyeRes.width, dyeRes.height, rgba.internalFormat, rgba.format, texType, filtering);
   velocity = createDoubleFBO(simRes.width, simRes.height, rg.internalFormat, rg.format, texType, filtering);
@@ -1370,20 +1376,29 @@ function step(dt) {
   blit(velocity.write);
   velocity.swap();
 
-  /* ---- viscosity (nu * laplacian u), implicit Jacobi. Music: energy thins the fluid, breakdowns thicken it. ---- */
+  /* ---- viscosity (nu * laplacian u), implicit Jacobi. Music: energy thins the fluid, breakdowns thicken it. ----
+     Jacobi only converges quickly for alpha <~ 1, so the requested alpha is split into N substeps of alpha/N each
+     (implicit diffusion composes exactly). That makes the smoothing scale with alpha — and with dt — instead of
+     saturating at the sweep count. */
   const nu = PHYS.viscosity * PHYS.musicVisc(dt);
   if (nu > 0.0005) {
-    copyProgram.bind();
-    gl.uniform1i(copyProgram.uniforms.uTexture, velocity.read.attach(0));
-    blit(velTmp);                                   /* u0 */
+    const alphaTotal = nu * PHYS.VISC_ALPHA * dt * 60.0;         /* 0 .. ~VISC_ALPHA*3 at 60 fps */
+    const sub = Math.min(PHYS.VISC_MAX_SUB, Math.max(1, Math.ceil(alphaTotal / 1.0)));
+    const alpha = alphaTotal / sub;
     viscosityProgram.bind();
     gl.uniform2f(viscosityProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
-    gl.uniform1i(viscosityProgram.uniforms.uSource, velTmp.attach(1));
-    gl.uniform1f(viscosityProgram.uniforms.alpha, nu * 6.0 * dt * 60.0);   /* alpha 0..6 at 60 fps; 12 Jacobi sweeps */
-    for (let i = 0; i < PHYS.VISC_ITERATIONS; i++) {
-      gl.uniform1i(viscosityProgram.uniforms.uVelocity, velocity.read.attach(0));
-      blit(velocity.write);
-      velocity.swap();
+    gl.uniform1f(viscosityProgram.uniforms.alpha, alpha);
+    for (let s = 0; s < sub; s++) {
+      copyProgram.bind();
+      gl.uniform1i(copyProgram.uniforms.uTexture, velocity.read.attach(0));
+      blit(velTmp);                                   /* u0 for this substep */
+      viscosityProgram.bind();
+      gl.uniform1i(viscosityProgram.uniforms.uSource, velTmp.attach(1));
+      for (let i = 0; i < PHYS.VISC_ITERATIONS; i++) {
+        gl.uniform1i(viscosityProgram.uniforms.uVelocity, velocity.read.attach(0));
+        blit(velocity.write);
+        velocity.swap();
+      }
     }
   }
 

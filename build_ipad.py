@@ -2,7 +2,7 @@
 Every edit is an exact-match replace; the script fails loudly if the desktop source drifts."""
 import sys, pathlib
 
-ROOT = pathlib.Path(r"C:\Users\ericd\Hermes Working Dir")
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "creative" / "fleur-noir.html"
 DST = ROOT / "fleur-noir-site" / "index.html"
 html = SRC.read_text(encoding="utf-8")
@@ -101,8 +101,8 @@ if (IS_TOUCH) {
 }
 ''')
 
-# mobile: fewer viscosity sweeps (the MacCormack + viscosity passes are the new cost)
-rep("  VISC_ITERATIONS: 12,", "  VISC_ITERATIONS: IS_TOUCH ? 8 : 12,")
+# mobile: cap viscosity substeps (the MacCormack + viscosity passes are the new cost)
+rep("  VISC_MAX_SUB: 6,", "  VISC_MAX_SUB: IS_TOUCH ? 4 : 6,")
 
 rep("  const dpr = Math.min(window.devicePixelRatio || 1, 2);",
     "  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);")
